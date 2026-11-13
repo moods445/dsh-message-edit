@@ -118,8 +118,10 @@ dsh plugin --profile web add -w link:/path/to/dsh-message-edit
 
 ## HTTP 接口
 
+两个接口都复用 `connection` 服务，受 DSH Web 登录鉴权与 Host/Origin 围栏保护；未认证或跨站请求返回 401/403。
+
 - `GET /message-edit?sessionId=<id>`：读取可编辑消息、可重试回合与完整版本树。
-- `POST /message-edit`：执行 `edit`、`reroll` 或 `retry`，返回已发布的新 Session ID。
+- `POST /message-edit`：执行 `edit`、`reroll` 或 `retry`，返回已发布的新 Session ID。请求体上限 4 MiB。
 
 ## 范围边界
 

@@ -71,9 +71,11 @@ declare module '@deepseek-ai/dsh-session' {
 interface HttpRequestLike {
   method?: string
   url?: string
+  headers?: Record<string, string | string[] | undefined>
   on(event: 'data', listener: (chunk: Uint8Array | string) => void): this
   on(event: 'end', listener: () => void): this
   on(event: 'error', listener: (error: unknown) => void): this
+  destroy?(): void
 }
 
 interface HttpResponseLike {
@@ -89,9 +91,18 @@ interface HttpServerLike {
   }): () => void
 }
 
+/** Minimal auth face of the Connection service: requestRejection applies the
+ * Host/Origin fence and requires an authenticated browser or API peer. */
+interface ConnectionLike {
+  requestRejection(request: {
+    headers: Record<string, string | string[] | undefined>
+  }): 401 | 403 | undefined
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     webServer: HttpServerLike
+    connection: ConnectionLike
   }
 }
 
@@ -100,6 +111,7 @@ export const name = 'message-edit'
 
 /** Public services used by the branch transaction and timeline projection. */
 export const inject = [
+  'connection',
   'sessions',
   'agents',
   'sessionPersistence',
@@ -828,11 +840,21 @@ function decodeOperation(value: unknown): MessageEditOperation {
   }
 }
 
+/** 请求体上限，避免无限制累加导致内存耗尽。 */
+const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+
 function requestJson(request: HttpRequestLike): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const decoder = new TextDecoder()
     let text = ''
+    let bytes = 0
     request.on('data', (chunk) => {
+      bytes += typeof chunk === 'string' ? chunk.length : chunk.byteLength
+      if (bytes > MAX_REQUEST_BODY_BYTES) {
+        reject(new TypeError('请求体超过大小限制。'))
+        request.destroy?.()
+        return
+      }
       text += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true })
     })
     request.on('end', () => {
@@ -856,6 +878,12 @@ function respondJson(response: HttpResponseLike, status: number, value: unknown)
 }
 
 async function handleRoute(ctx: Context, request: HttpRequestLike, response: HttpResponseLike): Promise<void> {
+  const rejection = ctx.connection.requestRejection({ headers: request.headers ?? {} })
+  if (rejection !== undefined) {
+    response.writeHead(rejection)
+    response.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+    return
+  }
   try {
     if (request.method === 'GET') {
       const url = new URL(request.url ?? MESSAGE_EDIT_PATH, 'http://message-edit.local')

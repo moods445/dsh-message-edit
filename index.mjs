@@ -11,6 +11,7 @@ const MESSAGE_EDIT_VERSION_SCHEMA = 2;
 const name = "message-edit";
 /** Public services used by the branch transaction and timeline projection. */
 const inject = [
+	"connection",
 	"sessions",
 	"agents",
 	"sessionPersistence",
@@ -606,11 +607,20 @@ function decodeOperation(value) {
 		default: throw new TypeError("action 必须是 edit、reroll 或 retry。");
 	}
 }
+/** 请求体上限，避免无限制累加导致内存耗尽。 */
+const MAX_REQUEST_BODY_BYTES = 4194304;
 function requestJson(request) {
 	return new Promise((resolve, reject) => {
 		const decoder = new TextDecoder();
 		let text = "";
+		let bytes = 0;
 		request.on("data", (chunk) => {
+			bytes += typeof chunk === "string" ? chunk.length : chunk.byteLength;
+			if (bytes > MAX_REQUEST_BODY_BYTES) {
+				reject(/* @__PURE__ */ new TypeError("请求体超过大小限制。"));
+				request.destroy?.();
+				return;
+			}
 			text += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
 		});
 		request.on("end", () => {
@@ -632,6 +642,12 @@ function respondJson(response, status, value) {
 	response.end(JSON.stringify(value));
 }
 async function handleRoute(ctx, request, response) {
+	const rejection = ctx.connection.requestRejection({ headers: request.headers ?? {} });
+	if (rejection !== void 0) {
+		response.writeHead(rejection);
+		response.end(rejection === 401 ? "unauthorized" : "forbidden");
+		return;
+	}
 	try {
 		if (request.method === "GET") {
 			respondJson(response, 200, await timeline(ctx, sessionIdOf(new URL(request.url ?? "/message-edit", "http://message-edit.local").searchParams.get("sessionId"))));
