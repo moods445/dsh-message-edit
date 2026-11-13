@@ -1,12 +1,11 @@
-//#region src/shared.ts
+// src/shared.ts
 /** Same-origin endpoint owned by the Message Edit host plugin. */
 const MESSAGE_EDIT_PATH = "/message-edit";
 /** Timeline sits between Trajectory (10) and Prompt Studio (20). */
 const MESSAGE_EDIT_VIEW_ORDER = 15;
 /** Current durable event schema for structurally paired version effects. */
 const MESSAGE_EDIT_VERSION_SCHEMA = 2;
-//#endregion
-//#region src/index.ts
+// src/index.ts
 /** Stable Cordis plugin name. */
 const name = "message-edit";
 /** Public services used by the branch transaction and timeline projection. */
@@ -14,7 +13,6 @@ const inject = [
 	"connection",
 	"sessions",
 	"agents",
-	"sessionPersistence",
 	"sessionQuery",
 	"workspaceRegistry",
 	"webServer"
@@ -38,7 +36,7 @@ function isTextualBlock(block) {
 function userText(message) {
 	return message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
 }
-function cloneUser(message, content = structuredClone(message.content)) {
+function cloneUser(message, content = [...message.content]) {
 	return Object.freeze({
 		id: crypto.randomUUID(),
 		role: "user",
@@ -261,11 +259,11 @@ async function withSourceAgent(ctx, sessionId, operation) {
 		await handle?.dispose();
 	}
 }
-function inheritedSeed(source, boundary) {
+function inheritedSeed(events, boundary) {
 	if (boundary === -1) return [];
-	const boundaryEvent = source.events[boundary];
+	const boundaryEvent = events[boundary];
 	if (boundary < 0 || boundaryEvent === void 0 || boundaryEvent.seq !== boundary) throw new Error("分支边界不是连续会话事件。");
-	return source.events.slice(0, boundary + 1);
+	return events.slice(0, boundary + 1);
 }
 /** Build seed envelopes locally; Session construction performs canonical validation and freezing. */
 function appendLogSeedEvent(events, type, data) {
@@ -276,20 +274,30 @@ function appendLogSeedEvent(events, type, data) {
 		data
 	});
 }
-function appendSurfaceSeedEvent(events, type, data, intent) {
+function appendSurfaceSeedEvent(events, type, data, surfaceOp) {
 	events.push({
 		type,
 		seq: events.length,
 		time: Date.now(),
 		data,
-		surfaceOp: intent.surfaceOp,
-		...intent.sourceEventSeqs === void 0 ? {} : { sourceEventSeqs: intent.sourceEventSeqs }
+		surfaceOp
+	});
+}
+/** The plugin-owned provenance record; downstream persistence must be able to
+* skip this unknown type on cold reads instead of refusing the whole session. */
+function appendVersionSeedEvent(events, version) {
+	events.push({
+		type: "message-edit/version",
+		seq: events.length,
+		time: Date.now(),
+		data: version,
+		ignorable: true
 	});
 }
 function appendManualTurn(events, manual) {
 	const { turn, user, assistant } = manual;
 	appendLogSeedEvent(events, "turn/start", { turn });
-	appendSurfaceSeedEvent(events, "user/message", user, { surfaceOp: "append" });
+	appendSurfaceSeedEvent(events, "user/message", user, "append");
 	appendLogSeedEvent(events, "step/start", {
 		turn,
 		step: 1
@@ -297,11 +305,9 @@ function appendManualTurn(events, manual) {
 	appendSurfaceSeedEvent(events, "assistant/message", {
 		turn,
 		step: 1,
-		message: assistant
-	}, {
-		surfaceOp: "append",
-		sourceEventSeqs: []
-	});
+		message: assistant,
+		stream: []
+	}, "append");
 	appendLogSeedEvent(events, "step/end", {
 		turn,
 		step: 1
@@ -312,34 +318,30 @@ function appendManualTurn(events, manual) {
 	});
 }
 function versionSeed(source, plan) {
-	const events = inheritedSeed(source, plan.boundary);
+	const events = inheritedSeed(source.snapshotEvents(), plan.boundary);
 	const inheritedLength = events.length;
-	appendLogSeedEvent(events, "message-edit/version", plan.version);
+	if (inheritedLength > 0) appendLogSeedEvent(events, "session/end-seed", { inherited: true });
+	appendVersionSeedEvent(events, plan.version);
 	if (plan.manualTurn !== void 0) appendManualTurn(events, plan.manualTurn);
 	return {
 		events,
 		inheritedLength
 	};
 }
-function sessionPreset(session) {
-	for (let index = session.events.length - 1; index >= 0; index -= 1) {
-		const event = session.events[index];
-		if (event?.type === "agent-preset/selected") return event.data.agentPreset;
-	}
-	return session.header.agentPreset;
-}
 async function createVersionAgent(ctx, source, childId, plan, options) {
 	const seed = versionSeed(source, plan);
 	const presets = ctx.get("agentPresets");
-	const presetId = sessionPreset(source);
 	let agentPreset;
 	let setup;
-	if (presets !== void 0 && presetId !== void 0) {
-		const resolved = (await presets.resolve(presetId)).id;
-		agentPreset = resolved;
-		setup = async (agentCtx) => {
-			await presets.mount(agentCtx, resolved);
-		};
+	if (presets !== void 0) {
+		const presetId = presets.presetForSession(source);
+		if (presetId !== null) {
+			const resolved = (await presets.resolve(presetId)).id;
+			agentPreset = resolved;
+			setup = async (agentCtx) => {
+				await presets.mount(agentCtx, resolved);
+			};
+		}
 	}
 	const child = await ctx.agents.create({
 		sessionId: childId,
@@ -347,9 +349,10 @@ async function createVersionAgent(ctx, source, childId, plan, options) {
 		meta: {
 			...source.header.cwd === void 0 ? {} : { cwd: source.header.cwd },
 			parentSession: source.id,
-			seedLength: seed.inheritedLength,
+			isSeeded: seed.inheritedLength > 0,
 			...agentPreset === void 0 ? {} : { agentPreset }
 		},
+		...seed.inheritedLength === 0 ? {} : { inheritedEventCount: seed.inheritedLength },
 		agentOptions: options,
 		...setup === void 0 ? {} : { setup }
 	});
@@ -379,7 +382,7 @@ async function runOperation(ctx, operation) {
 		const childId = sessionIdOf(`session-${crypto.randomUUID()}`);
 		const inverses = [];
 		try {
-			const events = source.session.events;
+			const events = source.session.snapshotEvents();
 			const plan = planOperation(operation, events);
 			const options = agentOptions(events, source.options);
 			const child = await createVersionAgent(ctx, source.session, childId, plan, options);
@@ -405,8 +408,7 @@ async function runOperation(ctx, operation) {
 		}
 	});
 }
-function ownVersionEvent(header, events) {
-	const inherited = header.seedLength ?? 0;
+function ownVersionEvent(header, events, inherited) {
 	const ownEvents = events.filter((event) => event.type === "message-edit/version" && event.seq >= inherited);
 	if (ownEvents.length === 0) return void 0;
 	if (ownEvents.length > 1) throw new Error(`会话 ${header.id} 包含多个自身版本效果。`);
@@ -476,23 +478,19 @@ async function mapConcurrent(items, worker) {
 	await Promise.all(Array.from({ length: workers }, () => run()));
 	return results;
 }
-/** Full log for the requested session: live borrow, persisted inspection, query fallback. */
-async function readCurrentLog(ctx, sessionId) {
+/** Full log for one session: live borrow first, then the live-preferred query
+* service's replay-validated cold read. */
+async function readSessionLog(ctx, sessionId) {
 	const live = ctx.sessions.get(sessionId);
-	if (live !== void 0) return live.events;
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.inspect(sessionId)).events;
-	return (await ctx.sessionQuery.readSession(sessionId)).events;
-}
-/** Own-version scan window for one lineage node: the tail from the durable
-* seed boundary is enough, and root nodes cannot carry a version effect. */
-async function versionLog(ctx, record) {
-	const inherited = record.header.seedLength ?? 0;
-	const live = ctx.sessions.get(record.header.id);
-	if (live !== void 0) return live.events.slice(inherited);
-	const persistence = ctx.get("sessionPersistence");
-	if (persistence !== void 0) return (await persistence.readFrom(record.header.id, inherited)).events;
-	return (await ctx.sessionQuery.readSession(record.header.id)).events.slice(inherited);
+	if (live !== void 0) return {
+		events: live.snapshotEvents(),
+		inheritedEventCount: live.inheritedEventCount
+	};
+	const snapshot = await ctx.sessionQuery.readSession(sessionId);
+	return {
+		events: snapshot.events,
+		inheritedEventCount: snapshot.inheritedEventCount
+	};
 }
 async function timeline(ctx, sessionId) {
 	const targetTrace = await ctx.sessionQuery.traceSession(sessionId);
@@ -500,9 +498,12 @@ async function timeline(ctx, sessionId) {
 	const rootTrace = rootId === sessionId ? targetTrace : await ctx.sessionQuery.traceSession(rootId);
 	const lineage = flattenLineage(rootTrace.target, rootTrace.descendants);
 	const logs = await mapConcurrent(lineage, async ({ record }) => {
-		if (record.header.id === sessionId) return readCurrentLog(ctx, sessionId);
-		if (record.header.parentSession === void 0) return [];
-		return versionLog(ctx, record);
+		if (record.header.id === sessionId) return readSessionLog(ctx, sessionId);
+		if (record.header.parentSession === void 0) return {
+			events: [],
+			inheritedEventCount: 0
+		};
+		return readSessionLog(ctx, record.header.id);
 	});
 	const recordsById = new Map(lineage.map(({ record }) => [record.header.id, record]));
 	const currentPath = /* @__PURE__ */ new Set();
@@ -512,7 +513,8 @@ async function timeline(ctx, sessionId) {
 		pathId = recordsById.get(pathId)?.header.parentSession;
 	}
 	const versions = lineage.map(({ record, depth }, index) => {
-		const version = ownVersionEvent(record.header, logs[index] ?? []);
+		const log = logs[index];
+		const version = ownVersionEvent(record.header, log?.events ?? [], log?.inheritedEventCount ?? 0);
 		return {
 			sessionId: record.header.id,
 			...record.header.parentSession === void 0 ? {} : { parentSessionId: record.header.parentSession },
@@ -554,7 +556,7 @@ async function timeline(ctx, sessionId) {
 	const currentIndex = versions.findIndex((version) => version.current);
 	const currentLog = logs[currentIndex];
 	if (currentIndex < 0 || currentLog === void 0) throw new Error("当前版本不在版本树中。");
-	const turns = closedTurns(currentLog);
+	const turns = closedTurns(currentLog.events);
 	return {
 		sessionId,
 		messages: editableMessages(turns),
@@ -672,5 +674,4 @@ function apply(ctx) {
 		handler: (request, response) => handleRoute(ctx, request, response)
 	}), "message-edit: HTTP route");
 }
-//#endregion
 export { MESSAGE_EDIT_PATH, MESSAGE_EDIT_VERSION_SCHEMA, MESSAGE_EDIT_VIEW_ORDER, apply, inject, name };

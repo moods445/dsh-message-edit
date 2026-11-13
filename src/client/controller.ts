@@ -1,15 +1,18 @@
 /** Browser controller for one session's Timeline projection and branch mutations. */
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+// Session-domain contracts come from the Session Controller's client entry;
+// the runtime-level ConversationSnapshot no longer exists in the shell.
 import type {
-  ClientContext,
-  ConversationSnapshot,
   ISessions,
-  ObservableSnapshot,
   SessionFace,
-  SessionId,
   SessionListState,
-  SnapshotStore,
-} from '@deepseek-ai/dsh-client-runtime/client'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+  SessionSnapshot,
+} from '@deepseek-ai/dsh-api-session-controller/client'
+// The snapshot-store engine is a seed-table module; import its value and its
+// contract types from there so the bundle resolves it through the module table.
+import type { ObservableSnapshot, SnapshotStore } from '@deepseek-ai/dsh-client-store'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import {
   MESSAGE_EDIT_PATH,
   type CascadePolicy,
@@ -175,11 +178,24 @@ async function responseValue(response: Response): Promise<unknown> {
   throw new Error(typeof error === 'string' ? error : `请求失败：HTTP ${String(response.status)}`)
 }
 
-function conversationRevision(snapshot: ConversationSnapshot): string {
-  const turnEnds = [...snapshot.turnEnds.entries()]
-    .map(([turn, seq]) => `${String(turn)}:${String(seq)}`)
-    .join(',')
-  return [snapshot.openState, snapshot.removed, snapshot.hasMore, turnEnds].join('|')
+function conversationRevision(snapshot: SessionSnapshot): string {
+  return [snapshot.openState, snapshot.removed, snapshot.hasMore, snapshot.running].join('|')
+}
+
+/** Open-turn boundary from the Conversation binding; empty when the Session is
+ * unbound or its Conversation assembly is not materialized. */
+function openTurnRevision(ctx: ClientContext, sessionId: SessionId): string {
+  try {
+    const openTurn = ctx.uiConversation.binding(sessionId).openTurn.getSnapshot()
+    return openTurn === undefined ? '' : String(openTurn)
+  } catch {
+    return ''
+  }
+}
+
+/** Combined per-session revision: lifecycle snapshot plus the open-turn boundary. */
+function sessionRevision(ctx: ClientContext, sessionId: SessionId, snapshot: SessionSnapshot): string {
+  return `${conversationRevision(snapshot)}#${openTurnRevision(ctx, sessionId)}`
 }
 
 function lineageRevision(snapshot: SessionListState, sessionId: SessionId): string {
@@ -336,10 +352,12 @@ export class MessageEditController {
     if (source === this.sessionSource) return false
     this.sessionSourceDispose?.()
     this.sessionSource = source
-    this.sessionRevision = source === undefined ? undefined : conversationRevision(source.getSnapshot())
+    this.sessionRevision = source === undefined
+      ? undefined
+      : sessionRevision(this.ctx, this.sessionId, source.getSnapshot())
     this.sessionSourceDispose = source?.subscribe(() => {
       if (this.sessionSource !== source) return
-      const revision = conversationRevision(source.getSnapshot())
+      const revision = sessionRevision(this.ctx, this.sessionId, source.getSnapshot())
       if (revision === this.sessionRevision) return
       this.sessionRevision = revision
       this.invalidate()
@@ -458,7 +476,7 @@ export class MessageEditController {
   /** Session-list publication is the reactive dependency for navigation. */
   private openWhenListed(sessionId: SessionId): Promise<void> {
     if (this.sessions.list.getSnapshot().byId[sessionId] !== undefined) {
-      this.sessions.open(sessionId)
+      this.ctx.uiWorkspace.openSession(sessionId)
       return Promise.resolve()
     }
     return new Promise((resolve) => {
@@ -469,7 +487,7 @@ export class MessageEditController {
         settled = true
         dispose()
         this.navigationWaits.delete(cancel)
-        if (open) this.sessions.open(sessionId)
+        if (open) this.ctx.uiWorkspace.openSession(sessionId)
         resolve()
       }
       const cancel = (): void => { finish(false) }

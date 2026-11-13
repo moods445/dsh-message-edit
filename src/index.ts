@@ -1,14 +1,15 @@
 /** Host half of Message Edit: turn-atomic forks and structurally reversible versions. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentOptions, AgentSetup } from '@deepseek-ai/dsh-agent'
-import type { PresetBearingSession } from '@deepseek-ai/dsh-agent-presets'
+import type { AgentPresetRegistry } from '@deepseek-ai/dsh-agent-preset-registry'
 import type {
   SessionId,
   Session,
   SessionEvent,
   SessionEventType,
+  SessionLogOffset,
   SurfaceEventType,
-  SurfaceIntent,
+  SurfaceOp,
 } from '@deepseek-ai/dsh-session'
 import type {
   SessionLineageNode,
@@ -114,7 +115,6 @@ export const inject = [
   'connection',
   'sessions',
   'agents',
-  'sessionPersistence',
   'sessionQuery',
   'workspaceRegistry',
   'webServer',
@@ -174,7 +174,7 @@ function userText(message: UserMessage): string {
     .join('\n')
 }
 
-function cloneUser(message: UserMessage, content: ContentBlock[] = structuredClone(message.content)): UserMessage {
+function cloneUser(message: UserMessage, content: ContentBlock[] = [...message.content]): UserMessage {
   return Object.freeze({
     id: crypto.randomUUID(),
     role: 'user' as const,
@@ -439,13 +439,13 @@ async function withSourceAgent<T>(
   }
 }
 
-function inheritedSeed(source: Session, boundary: number): SessionEvent[] {
+function inheritedSeed(events: readonly SessionEvent[], boundary: number): SessionEvent[] {
   if (boundary === -1) return []
-  const boundaryEvent = source.events[boundary]
+  const boundaryEvent = events[boundary]
   if (boundary < 0 || boundaryEvent === undefined || boundaryEvent.seq !== boundary) {
     throw new Error('分支边界不是连续会话事件。')
   }
-  return source.events.slice(0, boundary + 1)
+  return events.slice(0, boundary + 1)
 }
 
 /** Build seed envelopes locally; Session construction performs canonical validation and freezing. */
@@ -461,27 +461,42 @@ function appendSurfaceSeedEvent<T extends SurfaceEventType>(
   events: SessionEvent[],
   type: T,
   data: SessionEvent<T>['data'],
-  intent: SurfaceIntent,
+  surfaceOp: SurfaceOp,
 ): void {
   events.push({
     type,
     seq: events.length,
     time: Date.now(),
     data,
-    surfaceOp: intent.surfaceOp,
-    ...intent.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: intent.sourceEventSeqs },
-  } as SessionEvent<T>)
+    surfaceOp,
+  } as unknown as SessionEvent<T>)
+}
+
+/** The plugin-owned provenance record; downstream persistence must be able to
+ * skip this unknown type on cold reads instead of refusing the whole session. */
+function appendVersionSeedEvent(events: SessionEvent[], version: MessageEditVersionEvent): void {
+  events.push({
+    type: 'message-edit/version',
+    seq: events.length,
+    time: Date.now(),
+    data: version,
+    ignorable: true,
+  } as unknown as SessionEvent<'message-edit/version'>)
 }
 
 function appendManualTurn(events: SessionEvent[], manual: ManualAssistantTurn): void {
   const { turn, user, assistant } = manual
   appendLogSeedEvent(events, 'turn/start', { turn })
-  appendSurfaceSeedEvent(events, 'user/message', user, { surfaceOp: 'append' })
+  appendSurfaceSeedEvent(events, 'user/message', user, 'append')
   appendLogSeedEvent(events, 'step/start', { turn, step: 1 })
-  appendSurfaceSeedEvent(events, 'assistant/message', { turn, step: 1, message: assistant }, {
-    surfaceOp: 'append',
-    sourceEventSeqs: [],
-  })
+  // Assistant messages embed their provider stream; an empty replay record is
+  // the seed representation of a synthetic reply.
+  appendSurfaceSeedEvent(
+    events,
+    'assistant/message',
+    { turn, step: 1, message: assistant, stream: [] },
+    'append',
+  )
   appendLogSeedEvent(events, 'step/end', { turn, step: 1 })
   appendLogSeedEvent(events, 'turn/end', { turn, reason: { kind: 'completed' } })
 }
@@ -490,19 +505,14 @@ function versionSeed(source: Session, plan: OperationPlan): {
   events: SessionEvent[]
   inheritedLength: number
 } {
-  const events = inheritedSeed(source, plan.boundary)
+  const events = inheritedSeed(source.snapshotEvents(), plan.boundary)
   const inheritedLength = events.length
-  appendLogSeedEvent(events, 'message-edit/version', plan.version)
+  // A seeded fork seed must carry its inherited cut marker; the Session
+  // constructor rejects an extended seed without it.
+  if (inheritedLength > 0) appendLogSeedEvent(events, 'session/end-seed', { inherited: true })
+  appendVersionSeedEvent(events, plan.version)
   if (plan.manualTurn !== undefined) appendManualTurn(events, plan.manualTurn)
   return { events, inheritedLength }
-}
-
-function sessionPreset(session: PresetBearingSession): string | undefined {
-  for (let index = session.events.length - 1; index >= 0; index -= 1) {
-    const event = session.events[index]
-    if (event?.type === 'agent-preset/selected') return event.data.agentPreset
-  }
-  return session.header.agentPreset
 }
 
 async function createVersionAgent(
@@ -513,14 +523,16 @@ async function createVersionAgent(
   options: AgentOptions,
 ): Promise<AgentHandle> {
   const seed = versionSeed(source, plan)
-  const presets = ctx.get('agentPresets')
-  const presetId = sessionPreset(source)
+  const presets: AgentPresetRegistry | undefined = ctx.get('agentPresets')
   let agentPreset: string | undefined
   let setup: AgentSetup | undefined
-  if (presets !== undefined && presetId !== undefined) {
-    const resolved = (await presets.resolve(presetId)).id
-    agentPreset = resolved
-    setup = async (agentCtx) => { await presets.mount(agentCtx, resolved) }
+  if (presets !== undefined) {
+    const presetId = presets.presetForSession(source)
+    if (presetId !== null) {
+      const resolved = (await presets.resolve(presetId)).id
+      agentPreset = resolved
+      setup = async (agentCtx) => { await presets.mount(agentCtx, resolved) }
+    }
   }
   const child = await ctx.agents.create({
     sessionId: childId,
@@ -528,9 +540,10 @@ async function createVersionAgent(
     meta: {
       ...source.header.cwd === undefined ? {} : { cwd: source.header.cwd },
       parentSession: source.id,
-      seedLength: seed.inheritedLength,
+      isSeeded: seed.inheritedLength > 0,
       ...agentPreset === undefined ? {} : { agentPreset },
     },
+    ...seed.inheritedLength === 0 ? {} : { inheritedEventCount: seed.inheritedLength as SessionLogOffset },
     agentOptions: options,
     ...setup === undefined ? {} : { setup },
   })
@@ -567,7 +580,7 @@ async function runOperation(ctx: Context, operation: MessageEditOperation): Prom
     const childId = sessionIdOf(`session-${crypto.randomUUID()}`)
     const inverses: OperationInverse[] = []
     try {
-      const events = source.session.events
+      const events = source.session.snapshotEvents()
       const plan = planOperation(operation, events)
       const options = agentOptions(events, source.options)
       const child = await createVersionAgent(ctx, source.session, childId, plan, options)
@@ -596,8 +609,8 @@ async function runOperation(ctx: Context, operation: MessageEditOperation): Prom
 function ownVersionEvent(
   header: SessionRecord['header'],
   events: readonly SessionEvent[],
+  inherited: number,
 ): VersionProjection | undefined {
-  const inherited = header.seedLength ?? 0
   const ownEvents = events.filter((event): event is SessionEvent<'message-edit/version'> => (
     event.type === 'message-edit/version' && event.seq >= inherited
   ))
@@ -661,13 +674,6 @@ function flattenLineage(
   return result
 }
 
-/** Minimal read face of the optional persistence service; borrowed events are
- * consumed synchronously inside one timeline projection. */
-interface PersistenceReaderLike {
-  inspect(sessionId: SessionId, signal?: AbortSignal): Promise<{ events: readonly SessionEvent[] }>
-  readFrom(sessionId: SessionId, fromSeq: number, signal?: AbortSignal): Promise<{ events: readonly SessionEvent[] }>
-}
-
 /** Bounded parallel inspection of persisted branches; matches the corpus worker shape. */
 const TIMELINE_READ_CONCURRENCY = 4
 
@@ -690,24 +696,21 @@ async function mapConcurrent<T, R>(
   return results
 }
 
-/** Full log for the requested session: live borrow, persisted inspection, query fallback. */
-async function readCurrentLog(ctx: Context, sessionId: SessionId): Promise<readonly SessionEvent[]> {
-  const live = ctx.sessions.get(sessionId)
-  if (live !== undefined) return live.events
-  const persistence = ctx.get('sessionPersistence') as PersistenceReaderLike | undefined
-  if (persistence !== undefined) return (await persistence.inspect(sessionId)).events
-  return (await ctx.sessionQuery.readSession(sessionId)).events
+/** One full logical-log read plus its exact fork-inherited cut. */
+interface SessionLogRead {
+  events: readonly SessionEvent[]
+  inheritedEventCount: number
 }
 
-/** Own-version scan window for one lineage node: the tail from the durable
- * seed boundary is enough, and root nodes cannot carry a version effect. */
-async function versionLog(ctx: Context, record: SessionRecord): Promise<readonly SessionEvent[]> {
-  const inherited = record.header.seedLength ?? 0
-  const live = ctx.sessions.get(record.header.id)
-  if (live !== undefined) return live.events.slice(inherited)
-  const persistence = ctx.get('sessionPersistence') as PersistenceReaderLike | undefined
-  if (persistence !== undefined) return (await persistence.readFrom(record.header.id, inherited)).events
-  return (await ctx.sessionQuery.readSession(record.header.id)).events.slice(inherited)
+/** Full log for one session: live borrow first, then the live-preferred query
+ * service's replay-validated cold read. */
+async function readSessionLog(ctx: Context, sessionId: SessionId): Promise<SessionLogRead> {
+  const live = ctx.sessions.get(sessionId)
+  if (live !== undefined) {
+    return { events: live.snapshotEvents(), inheritedEventCount: live.inheritedEventCount }
+  }
+  const snapshot = await ctx.sessionQuery.readSession(sessionId)
+  return { events: snapshot.events, inheritedEventCount: snapshot.inheritedEventCount }
 }
 
 async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEditTimeline> {
@@ -717,10 +720,11 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
     : targetTrace.ancestors.at(-1)?.header.id ?? sessionId
   const rootTrace = rootId === sessionId ? targetTrace : await ctx.sessionQuery.traceSession(rootId)
   const lineage = flattenLineage(rootTrace.target, rootTrace.descendants)
-  const logs = await mapConcurrent(lineage, async ({ record }): Promise<readonly SessionEvent[]> => {
-    if (record.header.id === sessionId) return readCurrentLog(ctx, sessionId)
-    if (record.header.parentSession === undefined) return []
-    return versionLog(ctx, record)
+  const logs = await mapConcurrent(lineage, async ({ record }): Promise<SessionLogRead> => {
+    if (record.header.id === sessionId) return readSessionLog(ctx, sessionId)
+    // Root nodes cannot carry an own version effect; skip their full read.
+    if (record.header.parentSession === undefined) return { events: [], inheritedEventCount: 0 }
+    return readSessionLog(ctx, record.header.id)
   })
   const recordsById = new Map(lineage.map(({ record }) => [record.header.id, record]))
   const currentPath = new Set<SessionId>()
@@ -731,7 +735,8 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
   }
 
   const versions: VersionSummary[] = lineage.map(({ record, depth }, index) => {
-    const version = ownVersionEvent(record.header, logs[index] ?? [])
+    const log = logs[index]
+    const version = ownVersionEvent(record.header, log?.events ?? [], log?.inheritedEventCount ?? 0)
     return {
       sessionId: record.header.id,
       ...record.header.parentSession === undefined ? {} : { parentSessionId: record.header.parentSession },
@@ -777,7 +782,7 @@ async function timeline(ctx: Context, sessionId: SessionId): Promise<MessageEdit
   const currentIndex = versions.findIndex(version => version.current)
   const currentLog = logs[currentIndex]
   if (currentIndex < 0 || currentLog === undefined) throw new Error('当前版本不在版本树中。')
-  const turns = closedTurns(currentLog)
+  const turns = closedTurns(currentLog.events)
   return {
     sessionId,
     messages: editableMessages(turns),
